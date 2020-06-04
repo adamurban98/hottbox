@@ -261,6 +261,157 @@ class CPD(BaseCPD):
         print('At the moment, `plot()` is not implemented for the {}'.format(self.name))
 
 
+class NNCPD(BaseCPD):
+    """ Non negative CPD
+    """
+
+    def __init__(self, init='svd', max_iter=50, epsilon=10e-3, tol=10e-5,
+                 random_state=None, verbose=False) -> None:
+        super(NNCPD, self).__init__(init=init,
+                                  max_iter=max_iter,
+                                  epsilon=epsilon,
+                                  tol=tol,
+                                  random_state=random_state,
+                                  verbose=verbose)
+        self.cost = []
+
+    def copy(self):
+        """ Copy of the CPD algorithm as a new object """
+        new_object = super(NNCPD, self).copy()
+        new_object.cost = []
+        return new_object
+
+    @property
+    def name(self):
+        """ Name of the decomposition
+
+        Returns
+        -------
+        decomposition_name : str
+        """
+        decomposition_name = super(NNCPD, self).name
+        return decomposition_name
+
+    def decompose(self, tensor, rank, keep_meta=0, kr_reverse=False, factor_mat=None):
+        """ Performs CPD-ALS on the ``tensor`` with respect to the specified ``rank``
+
+        Parameters
+        ----------
+        tensor : Tensor
+            Multi-dimensional data to be decomposed
+        rank : tuple
+            Desired Kruskal rank for the given ``tensor``. Should contain only one value.
+            If it is greater then any of dimensions then random initialisation is used
+        keep_meta : int
+            Keep meta information about modes of the given ``tensor``.
+            0 - the output will have default values for the meta data
+            1 - keep only mode names
+            2 - keep mode names and indices
+        kr_reverse : bool
+        factor_mat : list(np.ndarray)
+            Initial list of factor matrices.
+            Specifying this option will ignore ``init``.
+
+        Returns
+        -------
+        tensor_cpd : TensorCPD
+            CP representation of the ``tensor``
+
+        Notes
+        -----
+        khatri-rao product should be of matrices in reversed order. But this will duplicate original data (e.g. images)
+        Probably this has something to do with data ordering in Python and how it relates to kr product
+        """
+        if not isinstance(tensor, Tensor):
+            raise TypeError("Parameter `tensor` should be an object of `Tensor` class!")
+        if not isinstance(rank, tuple):
+            raise TypeError("Parameter `rank` should be passed as a tuple!")
+        if len(rank) != 1:
+            raise ValueError("Parameter `rank` should be tuple with only one value!")
+        if factor_mat is None:
+            fmat = self._init_fmat(tensor, rank)
+        else:
+            if not isinstance(factor_mat, list):
+                raise TypeError("Parameter `factor_mat` should be a list object")
+            if not all(isinstance(m, np.ndarray) for m in factor_mat):
+                raise TypeError("Parameter `factor_mat` should be a list object of np.ndarray objects")
+            # Dimensionality checks
+            if len(factor_mat) != tensor.order:
+                raise ValueError("Parameter `factor_mat` should be of the same length as the tensor order")
+            if not all(m.shape == (mode, rank[0]) for m, mode in zip(factor_mat, tensor.shape)):
+                raise ValueError("Parameter `factor_mat` should have the shape [mode_n x r]. Incorrect shapes!")
+            fmat = factor_mat.copy()
+
+        self.cost = []  # Reset cost every time when method decompose is called
+        tensor_cpd = None
+        core_values = np.repeat(np.array([1]), rank)
+        norm = tensor.frob_norm
+        for n_iter in range(self.max_iter):
+
+            # Update factor matrices
+            for mode in range(tensor.order):
+                kr_result = khatri_rao(fmat, skip_matrix=mode, reverse=kr_reverse)
+                hadamard_result = hadamard([np.dot(mat.T, mat) for i, mat in enumerate(fmat) if i != mode])
+                # Do consecutive multiplication of np.ndarray
+                update = functools.reduce(np.dot, [tensor.unfold(mode, inplace=False).data,
+                                                   np.linalg.pinv(kr_result.T)])
+
+                # just bound all enties to at least 0
+                shape = update.shape
+
+                update = np.array([min(0, element) for element in update.flatten()]).reshape(shape)
+
+                fmat[mode] = update
+
+            # Update cost
+            tensor_cpd = TensorCPD(fmat=fmat, core_values=core_values)
+            residual = residual_tensor(tensor, tensor_cpd)
+            self.cost.append(abs(residual.frob_norm / norm))
+            if self.verbose:
+                print('Iter {}: relative error of approximation = {}'.format(n_iter, self.cost[-1]))
+
+            # Check termination conditions
+            if self.cost[-1] <= self.epsilon:
+                if self.verbose:
+                    print('Relative error of approximation has reached the acceptable level: {}'.format(self.cost[-1]))
+                break
+            if self.converged:
+                if self.verbose:
+                    print('Converged in {} iteration(s)'.format(len(self.cost)))
+                break
+        if self.verbose and not self.converged and self.cost[-1] > self.epsilon:
+            print('Maximum number of iterations ({}) has been reached. '
+                  'Variation = {}'.format(self.max_iter, abs(self.cost[-2] - self.cost[-1])))
+
+        if keep_meta == 1:
+            mode_names = {i: mode.name for i, mode in enumerate(tensor.modes)}
+            tensor_cpd.set_mode_names(mode_names=mode_names)
+        elif keep_meta == 2:
+            tensor_cpd.copy_modes(tensor)
+        else:
+            pass
+        return tensor_cpd
+
+    @property
+    def converged(self):
+        """ Checks convergence of the CPD-ALS algorithm.
+
+        Returns
+        -------
+        bool
+        """
+        is_converged = super(NNCPD, self).converged
+        return is_converged
+
+    def _init_fmat(self, tensor, rank):
+        fmat = super(NNCPD, self)._init_fmat(tensor=tensor,
+                                           rank=rank)
+        return fmat
+
+    def plot(self):
+        print('At the moment, `plot()` is not implemented for the {}'.format(self.name))
+
+
 # TODO: Fix efficiency issues with this
 class RandomisedCPD(BaseCPD):
     """ Randomised Canonical Polyadic Decomposition.
